@@ -703,3 +703,416 @@ for var in variables_cualitativas:
         plt.title(f"Frecuencias de la variable: {var}", fontsize=14, weight='bold')
         plt.tight_layout()
         plt.show()
+        
+
+import pandas as pd
+import numpy as np
+
+INPUT = "dataset_limpio_final.csv"
+
+# 1) Carga  de columnas duplicadas
+df = pd.read_csv(INPUT)
+df = df.loc[:, ~df.columns.duplicated()]
+
+# 2) Detección de tipos
+num_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+obj_cols = df.select_dtypes(include=['object']).columns.tolist()
+dt_cols  = df.select_dtypes(include=['datetime64[ns]']).columns.tolist()
+
+# Si hay fechas en texto, intenta convertirlas:
+for c in df.columns:
+    if df[c].dtype == 'object':
+        # Heurística: si parece fecha, conviértela
+        try_conv = pd.to_datetime(df[c], errors='ignore', infer_datetime_format=True)
+        if hasattr(try_conv, 'dt'):
+            # si convirtió (hay NaT y fechas), sustituye
+            if try_conv.notna().sum() > 0 and (try_conv.dtype == 'datetime64[ns]'):
+                df[c] = try_conv
+dt_cols = df.select_dtypes(include=['datetime64[ns]']).columns.tolist()
+
+# 3) Preparar vistas
+
+# --- NUMÉRICAS: skew y exceso de curtosis (---
+num_df = df[num_cols].copy()
+# quitar columnas sin variación
+num_df = num_df.loc[:, num_df.nunique(dropna=True) > 1]
+
+skew_num = num_df.skew(numeric_only=True)
+kurt_num = num_df.kurt(numeric_only=True)
+
+tabla_num = pd.DataFrame({
+    "variable": skew_num.index,
+    "skewness": skew_num.values,
+    "kurtosis_excess": kurt_num.reindex(skew_num.index).values,
+    "interpretacion": ""
+})
+
+def interp_skew(s):
+    if pd.isna(s): return ""
+    s = float(s)
+    if abs(s) < 0.1: return "≈ simétrica"
+    if s >= 0.1 and s < 0.5: return "asimetría + leve (cola derecha)"
+    if s >= 0.5: return "asimetría + marcada (cola derecha)"
+    if s <= -0.1 and s > -0.5: return "asimetría − leve (cola izquierda)"
+    return "asimetría − marcada (cola izquierda)"
+
+def interp_kurt(k):
+    if pd.isna(k): return ""
+    k = float(k)
+    if -0.5 <= k <= 0.5: return "curtosis ≈ normal"
+    if k > 0.5: return "leptocúrtica (colas pesadas)"
+    return "platicúrtica (colas ligeras)"
+
+tabla_num["interp_skew"] = tabla_num["skewness"].apply(interp_skew)
+tabla_num["interp_kurt"] = tabla_num["kurtosis_excess"].apply(interp_kurt)
+
+# Orden por |skew|
+tabla_num = tabla_num.sort_values("skewness", key=lambda s: s.abs(), ascending=False)
+
+# --- FECHAS: convertir a número (timestamp en días) y tratar como numéricas ---
+fecha_results = []
+for c in dt_cols:
+    s = df[c].dropna()
+    if s.empty: 
+        continue
+    # convertir a días (epoch días)
+    vals = (s.view('int64') / 1e9 / 86400.0)  # ns -> s -> días
+    skew = pd.Series(vals).skew()
+    kurt = pd.Series(vals).kurt()
+    fecha_results.append({
+        "variable": c,
+        "skewness": skew,
+        "kurtosis_excess": kurt,
+        "interp_skew": interp_skew(skew),
+        "interp_kurt": interp_kurt(kurt),
+        "nota": "Fecha convertida a escala numérica (días desde epoch)"
+    })
+tabla_fechas = pd.DataFrame(fecha_results)
+
+# --- CATEGÓRICAS: dos vistas ---
+cat_freq_rows = []
+cat_codes_rows = []
+
+for c in obj_cols:
+    s = df[c].dropna()
+    if s.empty:
+        continue
+
+    # (A) Vista por FRECUENCIAS de categorías
+    freq = s.value_counts()  # conteos por categoría
+    # Necesitamos al menos 2 categorías para forma
+    if freq.shape[0] > 1:
+        skew_f = freq.skew()
+        kurt_f = freq.kurt()
+        cat_freq_rows.append({
+            "variable": c,
+            "skewness_freq": skew_f,
+            "kurtosis_excess_freq": kurt_f,
+            "interp_skew_freq": interp_skew(skew_f),
+            "interp_kurt_freq": interp_kurt(kurt_f),
+            "advertencia": "Interpretar como forma de la distribución de frecuencias por categoría (no magnitud)."
+        })
+
+    # (B) Vista por CÓDIGOS ordinales 
+    cat = pd.Categorical(s)
+    codes = pd.Series(cat.codes).replace(-1, np.nan).dropna()
+    if codes.nunique() > 1:
+        skew_c = codes.skew()
+        kurt_c = codes.kurt()
+        cat_codes_rows.append({
+            "variable": c,
+            "skewness_codes": skew_c,
+            "kurtosis_excess_codes": kurt_c,
+            "interp_skew_codes": interp_skew(skew_c),
+            "interp_kurt_codes": interp_kurt(kurt_c),
+            "advertencia": "Codificación ordinal artificial; valores NO representan magnitud."
+        })
+
+tabla_cat_freq  = pd.DataFrame(cat_freq_rows)
+tabla_cat_codes = pd.DataFrame(cat_codes_rows)
+
+# 4) Guardar resultados
+tabla_num.to_csv("skew_kurtosis_numericas.csv", index=False)
+if not tabla_fechas.empty:
+    tabla_fechas.to_csv("skew_kurtosis_fechas.csv", index=False)
+if not tabla_cat_freq.empty:
+    tabla_cat_freq.to_csv("skew_kurtosis_categoricas_frecuencias.csv", index=False)
+if not tabla_cat_codes.empty:
+    tabla_cat_codes.to_csv("skew_kurtosis_categoricas_codigos.csv", index=False)
+
+# 5) Mostrar por pantalla
+print("\nNUMÉRICAS (interpretables):")
+print(tabla_num.round(3).to_string(index=False))
+
+if not tabla_fechas.empty:
+    print("\nFECHAS (convertidas a días epoch):")
+    print(tabla_fechas.round(3).to_string(index=False))
+
+if not tabla_cat_freq.empty:
+    print("\nCATEGÓRICAS – Vista por FRECUENCIAS (forma de conteos por categoría):")
+    print(tabla_cat_freq.round(3).to_string(index=False))
+
+if not tabla_cat_codes.empty:
+    print("\nCATEGÓRICAS – Vista por CÓDIGOS (ordinal artificial; usar con precaución):")
+    print(tabla_cat_codes.round(3).to_string(index=False))
+
+import pandas as pd
+
+
+
+# --- Cálculo ---
+skew = num_df.skew(numeric_only=True)
+kurt = num_df.kurt(numeric_only=True)  # exceso de curtosis (Fisher; normal = 0)
+
+# --- Construir tabla ---
+tabla = pd.DataFrame({
+    "Variable": skew.index,
+    "Skewness": skew.values,
+    "Kurtosis_Excess": kurt.reindex(skew.index).values
+})
+
+# --- Ordenar por magnitud de la asimetría ---
+tabla = tabla.sort_values("Skewness", key=lambda s: s.abs(), ascending=False)
+
+# --- Mostrar por pantalla ---
+print("\nTabla de asimetría y curtosis (exceso):")
+print(tabla.round(3).to_string(index=False))
+
+# --- Guardar en CSV ---
+tabla.round(6).to_csv("tabla_skew_kurtosis.csv", index=False)
+print("\nGuardado en: tabla_skew_kurtosis.csv")
+
+
+
+import pandas as pd
+import numpy as np
+
+# === Parámetros ===
+INPUT = "dataset_limpio_final.csv"
+OUT_TENDENCIA = "tabla_tendencia_central.csv"
+OUT_POSICION  = "tabla_posicion.csv"
+OUT_DISPERSION = "tabla_dispersion.csv"
+OUT_MODA_CATEG = "tabla_moda_categoricas.csv"
+
+# === Utilidades ===
+def modos(series, max_items=3):
+    """Devuelve hasta max_items modas (como texto concatenado) y el conteo de la primera moda."""
+    s = series.dropna()
+    if s.empty:
+        return pd.NA, 0
+    vc = s.value_counts()
+    top_vals = vc.index[:max_items]
+    top_str = " | ".join(map(str, top_vals))
+    return top_str, int(vc.iloc[0])
+
+def to_numeric_epoch_days(dt_series):
+    """
+    Convierte una serie datetime a días desde epoch (float) para poder calcular
+    varianza, std, MAD, etc. No modifica la original.
+    """
+    s = dt_series.dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
+    # astype('int64') -> nanosegundos desde epoch
+    ns = s.astype('int64')
+    days = ns / 1e9 / 86400.0
+    out = pd.Series(days, index=s.index)
+    return out
+
+# === Carga ===
+df = pd.read_csv(INPUT)
+# Elimina columnas duplicadas manteniendo la primera aparición
+df = df.loc[:, ~df.columns.duplicated()]
+
+# Tipos
+num_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+obj_cols = df.select_dtypes(include=['object']).columns.tolist()
+
+# Intentar convertir a datetime columnas object que realmente son fechas
+dt_cols_detectadas = []
+for c in obj_cols:
+    try:
+        converted = pd.to_datetime(df[c], errors='raise')
+        # Si convierte bien y hay al menos algún valor no nulo, sustituimos y registramos
+        if converted.notna().sum() > 0:
+            df[c] = converted
+            dt_cols_detectadas.append(c)
+    except Exception:
+        pass
+
+dt_cols = df.select_dtypes(include=['datetime64[ns]']).columns.tolist()
+
+# === Selección final de columnas por tipo ===
+num_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+obj_cols = df.select_dtypes(include=['object']).columns.tolist()
+dt_cols  = df.select_dtypes(include=['datetime64[ns]']).columns.tolist()
+
+# Quitar columnas numéricas sin variación
+num_cols = [c for c in num_cols if df[c].nunique(dropna=True) > 1]
+
+# === TENDENCIA CENTRAL ===
+tend_rows = []
+
+# Numéricas
+for c in num_cols:
+    s = df[c]
+    media = s.mean()
+    mediana = s.median()
+    moda_val, moda_freq = modos(s, max_items=1)
+    tend_rows.append({
+        "variable": c,
+        "tipo": "numérica",
+        "media": media,
+        "mediana": mediana,
+        "moda": moda_val,
+        "frecuencia_moda": moda_freq
+    })
+
+# Fechas (se puede calcular mediana/percentiles directamente; la media la expresamos como fecha)
+for c in dt_cols:
+    s = df[c].dropna()
+    if s.empty:
+        continue
+    mediana = s.median()  # pandas permite median en datetime
+    # Para la media transformamos a días, sacamos media y devolvemos como fecha aproximada
+    epoch_days = to_numeric_epoch_days(s)
+    media_days = epoch_days.mean()
+    fecha_media = pd.to_datetime(media_days * 86400.0, unit='s')  # vuelta desde días a timestamp
+    moda_val, moda_freq = modos(s.dt.date)  # moda por fecha (día)
+    tend_rows.append({
+        "variable": c,
+        "tipo": "fecha",
+        "media": fecha_media,
+        "mediana": mediana,
+        "moda": moda_val,
+        "frecuencia_moda": moda_freq
+    })
+
+# Categóricas: solo moda (tendencia central)
+moda_cat_rows = []
+for c in obj_cols:
+    moda_val, moda_freq = modos(df[c])
+    moda_cat_rows.append({
+        "variable": c,
+        "tipo": "categórica",
+        "moda": moda_val,
+        "frecuencia_moda": moda_freq
+    })
+
+tabla_tend = pd.DataFrame(tend_rows)
+tabla_moda_categoricas = pd.DataFrame(moda_cat_rows)
+
+# === POSICIÓN ===
+pos_rows = []
+
+# Numéricas
+for c in num_cols:
+    s = df[c].dropna()
+    pos_rows.append({
+        "variable": c,
+        "tipo": "numérica",
+        "min": s.min(),
+        "percentil_10": s.quantile(0.10),
+        "cuartil_1 (P25)": s.quantile(0.25),
+        "mediana (P50)": s.quantile(0.50),
+        "cuartil_3 (P75)": s.quantile(0.75),
+        "percentil_90": s.quantile(0.90),
+        "max": s.max()
+    })
+
+# Fechas (pandas soporta quantile en datetime)
+for c in dt_cols:
+    s = df[c].dropna()
+    if s.empty:
+        continue
+    pos_rows.append({
+        "variable": c,
+        "tipo": "fecha",
+        "min": s.min(),
+        "percentil_10": s.quantile(0.10),
+        "cuartil_1 (P25)": s.quantile(0.25),
+        "mediana (P50)": s.quantile(0.50),
+        "cuartil_3 (P75)": s.quantile(0.75),
+        "percentil_90": s.quantile(0.90),
+        "max": s.max()
+    })
+
+tabla_pos = pd.DataFrame(pos_rows)
+
+# === DISPERSIÓN ===
+disp_rows = []
+
+# Numéricas
+for c in num_cols:
+    s = df[c].dropna()
+    if s.empty:
+        continue
+    var = s.var(ddof=1)               # varianza muestral
+    std = s.std(ddof=1)               # desviación estándar muestral
+    iqr = s.quantile(0.75) - s.quantile(0.25)
+    rango = s.max() - s.min()
+    mad = (s - s.median()).abs().median()  # MAD
+    cv = (std / s.mean()) if s.mean() != 0 else np.nan  # coeficiente de variación
+    disp_rows.append({
+        "variable": c,
+        "tipo": "numérica",
+        "varianza (ddof=1)": var,
+        "desviación_estándar (ddof=1)": std,
+        "IQR (P75-P25)": iqr,
+        "rango (max-min)": rango,
+        "MAD": mad,
+        "coef_variación (std/mean)": cv
+    })
+
+# Fechas: convertimos a días epoch para estimar dispersión
+for c in dt_cols:
+    sdt = df[c].dropna()
+    if sdt.empty:
+        continue
+    s = to_numeric_epoch_days(sdt)  # días como float
+    var = s.var(ddof=1)
+    std = s.std(ddof=1)
+    iqr = s.quantile(0.75) - s.quantile(0.25)
+    rango = s.max() - s.min()
+    mad = (s - s.median()).abs().median()
+    cv = (std / s.mean()) if s.mean() != 0 else np.nan
+    disp_rows.append({
+        "variable": c,
+        "tipo": "fecha (días epoch)",
+        "varianza (ddof=1)": var,
+        "desviación_estándar (ddof=1)": std,
+        "IQR (P75-P25)": iqr,
+        "rango (max-min)": rango,
+        "MAD": mad,
+        "coef_variación (std/mean)": cv
+    })
+
+tabla_disp = pd.DataFrame(disp_rows)
+
+# === Guardado ===
+tabla_tend.to_csv(OUT_TENDENCIA, index=False)
+tabla_pos.to_csv(OUT_POSICION, index=False)
+tabla_disp.to_csv(OUT_DISPERSION, index=False)
+tabla_moda_categoricas.to_csv(OUT_MODA_CATEG, index=False)
+
+print(f"Guardadas: \n- {OUT_TENDENCIA}\n- {OUT_POSICION}\n- {OUT_DISPERSION}\n- {OUT_MODA_CATEG}")
+
+
+import pandas as pd
+
+# Lista de archivos a mostrar
+archivos = [
+    "tabla_tendencia_central.csv",
+    "tabla_posicion.csv",
+    "tabla_dispersion.csv",
+    "tabla_moda_categoricas.csv"
+]
+
+# Mostrar cada tabla en consola
+for archivo in archivos:
+    print(f"\nContenido de {archivo}:")
+    try:
+        df = pd.read_csv(archivo)
+        print(df.to_string(index=False))  # Muestra todo sin índice
+    except Exception as e:
+        print(f"Error al leer {archivo}: {e}")
